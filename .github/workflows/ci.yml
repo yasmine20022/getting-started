@@ -1,0 +1,133 @@
+name: CI/CD to Minikube
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: app_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: "mysql://root:root@localhost:3306/app_test"
+      MYSQL_HOST: "localhost"
+      MYSQL_PORT: "3306"
+      MYSQL_USER: "root"
+      MYSQL_PASSWORD: "root"
+      MYSQL_DATABASE: "app_test"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        working-directory: app
+        run: |
+          if [ -f package-lock.json ]; then npm ci; \
+          elif [ -f yarn.lock ]; then corepack enable && yarn install --frozen-lockfile; \
+          elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile; \
+          elif [ -f package.json ]; then npm install; fi
+      - name: Build Docker image
+        run: docker build -t getting-started:latest -f Dockerfile app
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@latest
+      - name: Build image inside Minikube
+        run: |
+          eval $(minikube docker-env)
+          docker build -t getting-started:latest -f Dockerfile app
+      - name: Create Kubernetes manifest
+        run: |
+          mkdir -p /tmp/devops-autopilot-k8s
+          cat > /tmp/devops-autopilot-k8s/deployment.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: getting-started
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: getting-started
+            template:
+              metadata:
+                labels:
+                  app: getting-started
+              spec:
+                containers:
+                  - name: getting-started
+                    image: getting-started:latest
+                    imagePullPolicy: Never
+                    ports:
+                      - containerPort: 8000
+                    readinessProbe:
+                      tcpSocket:
+                        port: 8000
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    livenessProbe:
+                      tcpSocket:
+                        port: 8000
+                      initialDelaySeconds: 15
+                      periodSeconds: 10
+          EOF
+      - name: Deploy to Minikube
+        run: |
+          if [ -d k8s ]; then
+            kubectl apply -f k8s/
+          else
+            kubectl apply -f /tmp/devops-autopilot-k8s/deployment.yaml
+          fi
+      - name: Expose app inside cluster
+        run: |
+          kubectl expose deployment getting-started \
+            --name=getting-started \
+            --type=ClusterIP \
+            --port=80 \
+            --target-port=8000 \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/getting-started --timeout=120s
+      - name: Smoke test deployed app
+        run: |
+          kubectl port-forward service/getting-started 18080:80 > /tmp/getting-started-port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+
+          for path in /health /health/ /; do
+            for attempt in $(seq 1 20); do
+              if curl -fsS "http://127.0.0.1:18080$path" >/tmp/getting-started-response.txt; then
+                echo "Smoke test passed on $path"
+                exit 0
+              fi
+              sleep 2
+            done
+          done
+
+          echo "Smoke test failed: app did not return a successful HTTP response."
+          cat /tmp/getting-started-port-forward.log || true
+          kubectl get pods -o wide
+          kubectl describe deployment getting-started
+          kubectl logs deployment/getting-started --tail=100 || true
+          exit 1
